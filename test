@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -ex
+
+PYTHON=${PYTHON:-}
+
+cd $(dirname $(realpath ${BASH_SOURCE[0]}))
+
+rm -rf scratch
+mkdir scratch
+
+mkdir scratch/repos
+
+mkdir scratch/repos/a
+pushd scratch/repos/a
+  git init
+  echo "some contents" > file_in_repo_a
+  git add file_in_repo_a
+  git commit -m "initial commit for repo a"
+  repo_a_sha=$(git rev-parse HEAD)
+popd
+
+mkdir scratch/repos/b
+pushd scratch/repos/b
+  git init
+  echo "something here" > file_in_repo_b
+  git add file_in_repo_b
+  git commit -m "initial commit for repo b"
+  repo_b_sha=$(git rev-parse HEAD)
+popd
+
+mkdir scratch/repos/manifests
+pushd scratch/repos/manifests
+  git init
+  cat << EOF > default.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="origin" fetch="$(realpath ..)" />
+  <project path="a" name="a" remote="origin" revision="$repo_a_sha" />
+  <project path="b" name="b" remote="origin" revision="$repo_b_sha" />
+</manifest>
+EOF
+  git add default.xml
+  git commit -m "initial commit for manifests repo"
+  manifests_repo_sha=$(git rev-parse HEAD)
+popd
+
+mkdir scratch/work
+pushd scratch/work
+  $PYTHON ../../fastrepo init -b $manifests_repo_sha -u $(realpath ../repos/manifests)
+  $PYTHON ../../fastrepo init -b $manifests_repo_sha -u $(realpath ../repos/manifests) | grep "already up-to-date ($manifests_repo_sha)"
+
+  $PYTHON ../../fastrepo sync
+  $PYTHON ../../fastrepo sync     | grep "all 2 repos are up-to-date"
+  $PYTHON ../../fastrepo sync a   | grep "all 1 repos are up-to-date"
+  $PYTHON ../../fastrepo sync b   | grep "all 1 repos are up-to-date"
+  $PYTHON ../../fastrepo sync a b | grep "all 2 repos are up-to-date"
+  $PYTHON ../../fastrepo sync -v a b | grep "all 2 repos are up-to-date"
+  $PYTHON ../../fastrepo sync a -v b | grep "all 2 repos are up-to-date"
+  $PYTHON ../../fastrepo sync a b -v | grep "all 2 repos are up-to-date"
+popd
+
+echo Success

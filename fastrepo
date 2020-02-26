@@ -1,0 +1,205 @@
+#!/usr/bin/env python
+# Wraps the google repo tool. It's meant to be used with manifest files that use SHAs.
+# When using SHAs, repo revisions can be checked without network access.  This tool
+# takes advantage of this by checking shas before calling into the underlying repo tool.
+#
+# This can save alot of time if there are no updates.  the google 'repo' tool can take dozens
+# of seconds to check repos even if they are already up-to-date.  This tool usually runs in less
+# than a second in that case.
+#
+# Ideally this behavior should be upstreamed into the google repo tool.
+#
+import sys
+import os
+import re
+import subprocess
+
+SHA_REGEX = re.compile(r'^[0-9a-f]{40}$')
+
+def debugprint(msg):
+    pass
+    #print("DEBUG: " + msg)
+
+def valid_sha(s):
+    return True if re.match(SHA_REGEX, s) else False
+
+def try_run(args):
+    debugprint("running {}".format(args))
+    try:
+        return subprocess.check_output(args)
+    except subprocess.CalledProcessError:
+        return None
+
+def which(prog):
+    return try_run(["which", prog]).rstrip()
+
+class Project:
+    def __init__(self, path, revision):
+        self.path = path
+        self.revision = revision
+    def __repr__(self):
+        return self.__str__()
+    def __str__(self):
+        return "path={} revision={}".format(self.path, self.revision)
+
+def parse_manifest(manifest_repo_root, filename):
+    import xml.etree.ElementTree
+    root = xml.etree.ElementTree.parse(filename)
+    projects = []
+    for node in root.iter():
+        if node.tag == "include":
+            name = node.attrib['name']
+            projects += parse_manifest(manifest_repo_root, os.path.join(manifest_repo_root, name))
+        elif node.tag == "project":
+            projects.append(Project(node.attrib['path'], node.attrib['revision']))
+    return projects
+
+def get_head(repo_path):
+    git_cmd = ["git", "-C", repo_path, "rev-parse", "HEAD"]
+    git_result = try_run(git_cmd)
+    if git_result == None:
+        sys.exit("error: git command {} failed?".format(git_cmd))
+    sha = git_result.decode('ascii').rstrip()
+    if not valid_sha(sha):
+        sys.exit("error: codebug?  git rev-parse returned an invalid sha '{}'?".format(sha))
+    return sha
+
+def forward_to_repo(cmd, args):
+    repo_args = [sys.executable, which("repo"), cmd] + args
+    debugprint("repo command {}".format(repo_args))
+    os.execv(repo_args[0], repo_args)
+    sys.exit("error: os.exec of repo program failed")
+
+def init_command(lenient_mode, sha, args):
+    if not sha:
+        if not lenient_mode:
+            sys.exit("error: 'fastrepo' requires a sha be specified with '-b SHA' or 'lenient' to be given")
+        print("WARNING: 'fastrepo init' does not do anything special without '-b SHA'")
+    elif not valid_sha(sha):
+        if not lenient_mode:
+            sys.exit("error: '{}' is not a valid sha, this is only allowed if 'lenient' is given".format(sha))
+        print("WARNING: '{}' is not a valid SHA".format(sha))
+    elif not os.path.exists(".repo/manifests"):
+        debugprint(".repo/manifests does not exist")
+    else:
+        actual_sha = get_head(".repo/manifests")
+        if actual_sha == sha:
+            print(".repo/manifests already up-to-date ({})".format(sha))
+            return 0
+        print(".repo/manifests at {} but requsting {}".format(actual_sha, sha))
+    forward_to_repo("init", args)
+
+def find_repo_dir():
+  curdir = os.getcwd()
+  repo = None
+  olddir = None
+  while curdir != '/' and curdir != olddir and not repo:
+    repo = os.path.join(curdir, ".repo")
+    if not os.path.isdir(repo):
+      repo = None
+      olddir = curdir
+      curdir = os.path.dirname(curdir)
+  return repo
+
+def find_project_by_path(projects, path):
+    for proj in projects:
+        if proj.path == path:
+            return proj
+    return None
+
+def sync_command(lenient_mode, args):
+    repo_dir = find_repo_dir()
+    if not repo_dir:
+        sys.exit("error: not inside a multi-repo")
+    manifest_filename = os.path.join(repo_dir, "manifest.xml")
+    if not os.path.exists(manifest_filename):
+        sys.exit("error: manifest file '{}' does not exist".format(manfest_filename))
+
+    manifest_projects = parse_manifest(os.path.join(repo_dir, "manifests"), manifest_filename)
+
+    projects_to_check = []
+    option_args = []
+    for arg in args:
+        proj = find_project_by_path(manifest_projects, arg)
+        if proj:
+            projects_to_check.append(proj)
+        else:
+            option_args.append(arg)
+    if len(projects_to_check) == 0:
+        projects_to_check = manifest_projects
+
+    projects_to_update = []
+    for proj in projects_to_check:
+        needs_update = True
+        if not valid_sha(proj.revision):
+            if not lenient_mode:
+                sys.exit("error: project '{}' revision '{}' is not a valid SHA, please fix or specify 'lenient'".format(
+                    proj.path, proj.revision))
+            print("WARNING: project '{}' is not using a SHA for its revision".format(proj.path))
+        else:
+            repo_path = os.path.join(os.path.dirname(repo_dir), proj.path)
+            if not os.path.exists(repo_path):
+                debugprint("repo '{}' does not exist".format(repo_path))
+            else:
+                actual_sha = get_head(repo_path)
+                if actual_sha == proj.revision:
+                    print("{} already up-to-date ({})".format(proj.path, actual_sha))
+                    needs_update = False
+        if needs_update:
+            projects_to_update.append(proj.path)
+
+    if len(projects_to_update) == 0:
+        print("all {} repos are up-to-date".format(len(projects_to_check)))
+        return 0
+
+    forward_to_repo("sync", option_args + projects_to_update)
+
+def usage():
+    print("Usage: fastrepo [lenient] init -b SHA <args>")
+    print()
+    print("specifying 'lenient' means that fastrepo will still work even if SHAs are not given")
+
+def main():
+    args = sys.argv[1:]
+
+    if len(args) == 0:
+        usage()
+        sys.exit(1)
+
+    cmd = args[0]
+    args = args[1:]
+
+    lenient_mode = False
+
+    if cmd == "lenient":
+        lenient_mode = True
+        if len(args) == 0:
+            usage()
+            sys.exit(1)
+        cmd = args[0]
+        args = args[1:]
+
+    def get_opt_arg(args, i):
+        if i >= len(args):
+            print("error: option '{}' requires an argument".format(args[i-1]))
+            sys.exit(1)
+        return args[i]
+
+    if cmd == "init":
+        sha = None
+        arg_index = 0
+        while arg_index < len(args):
+            arg = args[arg_index]
+            if arg == "-b":
+                arg_index += 1
+                sha = get_opt_arg(args, arg_index)
+            arg_index += 1
+        sys.exit(init_command(lenient_mode, sha, args))
+
+    if cmd == "sync":
+        sys.exit(sync_command(lenient_mode, args))
+
+    print("unknown command '{0}'".format(cmd))
+    sys.exit(1)
+
+main()
